@@ -1,0 +1,609 @@
+---
+title: 'ST635 Final Project: Uber & Lyft Price Analysis'
+author: "Taoyanran Sun, Cheng Ling, Dana Barclay, Yun-Ting Sun"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r, include=FALSE}
+library(lubridate)
+library(anytime)
+library(ggplot2)
+library(tree)
+library(car)
+library(dplyr)
+library(stringr)
+library(rpart)
+library(rpart.plot)
+library(gridExtra)
+```
+
+## Introduction
+Uber and Lyft's ride prices are not constant like public transport. They are greatly affected by the demand and supply of rides at a given time. So what exactly drives this demand? 
+
+Uber and Lyft are both ride sharing companies that have phone applications where customers request a car to a certain location and then are driven to another location by a driver in the driver's own car.  Uber and Lyft are safer, cleaner, and more accessible alternatives to taxis and public transportation.  Uber and Lyft are direct competitors in the ridesharing industry.  Uber and Lyft were both founded in San Francisco, CA in 2009 and 2012, respectively.  Uber has 69% of marketshare while Lyft has 29% marketshare.  Uber has a lower base fare, and cost per minute while Lyft has a lower minimum ride price and cost per mile, making their pricing, as well as companies in general, extremely similar.  
+
+The data we analyzed is called "Uber & Lyft Cab Prices and was found on Kaggle.com.  The data was collected from "hot" locations in Boston November 26th to December 18th, 2018.  There are 632,403 observations overall and the data includes ride data for Uber and Lyft, which was collected every five minutes, and weather data for Boston, which was collected every 1 hour.  There were 18 variables between both data sets.
+
+
+```{r}
+weather <- read.csv("~/Desktop/cab/weather.csv")
+cab<- read.csv("~/Desktop/cab/cab_rides.csv")
+```
+
+
+## 1.Data Preparation
+
+The first step we took was to merge the weather and cab datasets based on the same time and location into a new data frame.  The variables that we ended up using were source, the starting point of the ride; destination, the destination of the ride; distance, between the source and destination; price, the estimated cost for the ride in USD; cab_type, Uber or Lyft service; name, the type of the cab (e.g. UberX, UberXL); temp, the termperature in Fahrenheit; rain, in inches for the previous hour; and wind, measured in MPH.
+
+We noticed that the rain variable had several missing values, which signified that there was no rain, so we changed the missing values to 0's. We also located and removed all other missing values in other columns and made sure there were no duplicate observations.  We then decided adding certain columns to our dataset would strengthen our analysis.  We created the columns weekday, Mon-Fri; weekend, Sat-Sun; price per mile, price / distance; surge, 1 if no surge, more than 1 if surge; bad weather, more than 0.1 inches of rain or a temperature of less than 32 degrees; service, to rename the values in the "name" variable for clarity; rush hour, 6AM to 10AM and 3PM to 7PM; pickup, coded as nearby or downtown depending on distance from Boston Center; and dropoff, coded as nearby or downtown depending on distance from Boston Center.  One anomaly we found was a few unusually large values for price per mile.  We believe these values signify cancelled rides that the customer still gets charged for.
+
+```{r}
+#Merge two data (base on same time and same location)
+sum(is.na(cab$time_stamp))
+sum(is.na(weather$time_stamp))
+
+#transfer time_stamp column
+
+full_df=cab
+
+full_df[,"time_stamp"] = as.numeric(unlist((full_df[,"time_stamp"])))/1000
+full_df[,"time_stamp"] <- anytime(unlist(full_df[,"time_stamp"]))
+
+
+full_df$day = str_sub(full_df$time_stamp,1,10)
+full_df$hours = str_sub(full_df$time_stamp,12,13)
+full_df$merge_time = paste(full_df$day,full_df$hours, full_df$source, sep = "-")
+#glimpse(full_df)
+
+w_df <- weather
+w_df[,"time_stamp"] = as.numeric(unlist((w_df[,"time_stamp"])))
+w_df[,"time_stamp"] <- anytime(unlist(w_df[,"time_stamp"]))
+
+
+w_df$day = str_sub(w_df$time_stamp,1,10)
+w_df$hours = str_sub(w_df$time_stamp,12,13)
+w_df$merge_time = paste(w_df$day,w_df$hours, w_df$location, sep = "-")
+#glimpse(w_df)
+
+
+```
+```{r}
+#clean w_df 
+
+sum(is.na(w_df$rain))
+w_df$rain[is.na(w_df$rain)] <- 0
+
+length(unique(w_df$merge_time))
+w_df = w_df[!duplicated(w_df$merge_time),]
+
+```
+```{r}
+#merge two data set by merge time (inner join)
+df1 <- merge(x = full_df, y = w_df, by = "merge_time")
+
+
+#check missing values
+sapply(df1, function(x) sum(is.na(x)))
+```
+
+```{r}
+#add some columns & change data type
+df1$weekday <- weekdays(as.Date(df1$day.x))
+df1$price_per_mile <- df1$price / df1$distance
+df1$surge = ifelse(df1$surge_multiplier==1,0,1)
+df1$bad_weather <- ifelse((df1$rain >=0.1)|(df1$temp<=32),1,0)
+
+df1$day.x <- as.Date(df1$day.x)
+df1$hours.x <- as.factor(df1$hours.x)
+df1$weekday <- as.factor(df1$weekday)
+df1$surge <- as.factor(df1$surge)
+df1$bad_weather <- as.factor(df1$bad_weather)
+
+df1$Isweekend <- ifelse((df1$weekday == 'Saturday')|(df1$weekday == 'Sunday'),1,0)
+df1$rush_hour <- ifelse(df1$hours.x %in% c(06,07,08,09,15,16,17,18),1,0)
+df1$rush_hour <- as.factor(df1$rush_hour)
+
+df1$service <- car::recode(df1$name,"c('Black', 'Black SUV')='Uber Premium'; c('UberXL', 'UberX','UberPool','WAV')='Uber Economy';c('Lux','Lux Black XL', 'Lux Black')='Lyft Premium';c('Lyft', 'Lyft XL','Shared')='Lyft Economy'")
+
+df1$Isweekend <- as.factor(df1$Isweekend)
+df1$rush_hour <- as.factor(df1$rush_hour)
+
+
+```
+```{r}
+df1$pickup <- car::recode(df1$source,"c('Back Bay', 'Boston University', 'Fenway', 'Northeastern University')='Nearby'; c('Beacon Hill', 'Financial District','Haymarket Square','North End','North Station','South Station','Theatre District','West End')='Downtown'")
+
+df1$dropoff <- car::recode(df1$destination,"c('Back Bay', 'Boston University', 'Fenway', 'Northeastern University')='Nearby'; c('Beacon Hill', 'Financial District','Haymarket Square','North End','North Station','South Station','Theatre District','West End')='Downtown'")
+
+df1$pickup <- as.factor(df1$pickup)
+df1$dropoff <- as.factor(df1$dropoff)
+
+```
+```{r}
+keeps <- c("distance", "pickup", 'dropoff', 'price','surge_multiplier','price_per_mile','surge','bad_weather','Isweekend','rush_hour','service','destination','source','weekday')
+df1 <- df1[keeps]
+
+summary(df1)
+```
+
+To begin our analysis, we split our data set into two based on whether the cab type was Uber or Lyft.  We then created a training set with half the observations from the full data set, and created a test set using the other half of the observations.
+
+
+```{r}
+# Split dataset
+# uber
+uber <- df1[df1$service %in% c('Uber Economy','Uber Premium'),]
+
+set.seed(123)
+train_num_u <- sample(1:nrow(uber), size= as.integer(nrow(uber)*0.5)) 
+train_u <- uber[train_num_u,]
+test_u <- uber[-train_num_u,]
+
+# lyft
+lyft <- df1[df1$service %in% c('Lyft Economy','Lyft Premium'),]
+
+set.seed(123)
+train_num_l <- sample(1:nrow(lyft), size= as.integer(nrow(lyft)*0.5)) 
+train_l <- lyft[train_num_l,]
+test_l <- lyft[-train_num_l,]
+```
+
+## 2.Price Per Mile Analysis
+
+### Linear Regression
+
+We decided to begin with a linear regression model to find which predictors most accurately predict price per mile for Uber and then for Lyft.  For each cab type, we started with a basic multiple linear regression model.  This model had a poor R^2, so we continued to try to fit a better model.  Next, we found that the best transformation for the distance variable is to raise it to the 0.4, so we applied that to the previous model and still had a low R^2, so we found that the best transformation for the response variable was to take it's log.  Our best linear model for predicting price per mile in Ubers used the transformed distance variable and service as interaction terms, bad weather, weekend, rush hour, pick up, and drop off to predict price per mile.  Using the Anova test, we see that a change in the variables distance, service, pick up and drop off will affect the price per mile.  The R^2 was 0.8054, which is high, and had almost all useful predictors.  Additionally, the p-value was small, so this model is a good fit for the data.  Additionally, the MSE was 0.25, so the model explains 26% of variance in testing data set.  We then checked that the model assumptions held, which is explained below. 
+
+```{r}
+#uber 
+
+m4 <- lm(price_per_mile ~ distance * service + bad_weather + Isweekend + rush_hour + pickup + dropoff , data = train_u)
+summary(m4)
+
+#transform predictors(0.4)
+summary(powerTransform(distance~1, data = train_u, family = 'bcPower'))
+m5 <- lm(price_per_mile ~ I(distance^0.4) * service + bad_weather + Isweekend + rush_hour + pickup + dropoff , data = train_u)
+summary(m5)
+
+# transform response(use log for better explaination)
+summary(powerTransform(price_per_mile ~ I(distance^0.4) * service + bad_weather + Isweekend + rush_hour+ pickup + dropoff , data = train_u,family = 'bcPower'))
+
+m6 <- lm(log(price_per_mile) ~ I(distance^0.4) * service + bad_weather + Isweekend + rush_hour+ pickup + dropoff , data = train_u)
+summary(m6)
+
+
+#check assumptions
+residualPlot(m6)
+qqPlot(m6)
+spreadLevelPlot(m6)
+
+#compute test rate 
+pred_u <- predict(m6,newdata = test_u,se.fit = TRUE)
+rss_u <- sum((test_u$price_per_mile - exp(pred_u$fit))^2)
+(rsquare_u <- 1- rss_u/sum((test_u$price_per_mile - mean(test_u$price_per_mile))^2))
+
+
+```
+
+First, the residuals-fitted plot shows a line, that is not terribly curved, around 0, which means we have no violation in linear relationship assumptions. The qq-plot shows a skew on the top right and means the residuals may not be normally distributed, which might caused by those presumed cancelled orders we mentioned previously. For spread level plot, It is fine that the plot shows a flat line around 0.
+
+
+
+
+We then moved on to fitting a linear regression model to predict price per mile for Lyft rides.  We found that surge data was only available for Lyft, so we included that as a regressor for our linear model.  After running our first model, we found that the R^2 was around 0.5.  While this is not bad, we thought we could do better, so again we found the best transofrmation for the predictors.  We again found that distance should be transformed to distance^0.4, and fit another model to include that.  The R^2 in this model increased only marginally, so we found the best transformation for the response variable, which ended up being a log transformation again.  This increased the R^2 considerably to 0.7209.  This model uses distance, service, bad weather, weekend, rush hour, pick up, drop off, and surge multiplier to predict the price per mile of a Lyft.  Using the Anova test, we see that a change in the variables distance, service, pick up, drop off, and surge multiplier will affect the price per mile.  Since the p-value for the model summary is so small, this model is a good fit for the training data. The test rate for this model is 0.66,  so the model explains 66% of the variance in in the testing data set. 
+
+
+```{r}
+#lyft
+
+m7 <- lm(price_per_mile ~ distance + service + bad_weather + Isweekend + rush_hour + pickup + dropoff +surge_multiplier , data = train_l)
+summary(m7)
+
+
+#transform predictors(0.4)
+summary(powerTransform(distance~1, data = train_l, family = 'bcPower'))
+m8 <- lm(price_per_mile ~ I(distance^0.4) + service + bad_weather + Isweekend + rush_hour + pickup + dropoff +surge_multiplier , data = train_l)
+summary(m8)
+
+# transform response(log)
+summary(powerTransform(price_per_mile ~ I(distance^0.4) + service + bad_weather + Isweekend + rush_hour + pickup + dropoff+surge_multiplier, data = train_l,family = 'bcPower'))
+
+m9 <- lm(log(price_per_mile) ~ I(distance^0.4) + service + bad_weather + Isweekend + rush_hour + pickup + dropoff+surge_multiplier , data = train_l)
+summary(m9)
+
+
+#check assumptions
+residualPlot(m9)
+qqPlot(m9)
+spreadLevelPlot(m9)
+
+
+#test rate 0.66
+pred_l <- predict(m9,newdata = test_l,se.fit = TRUE)
+rss_l <- sum((test_l$price_per_mile - exp(pred_l$fit))^2)
+(rsquare_l <- 1- rss_l/sum((test_l$price_per_mile - mean(test_l$price_per_mile))^2))
+
+```
+
+The residuals-fitted plot shows a flat line around 0, which means we have no violation in linear relationship assumptions. The qq-plot stays close to the line, meaning the residuals are likely normally distributed. For spread level plot, It is fine that the plot shows a flat line around 0.
+
+
+
+### Regression Tree
+
+We then fit a regression tree for the best linear models for both Uber and Lyft.
+
+The original regression tree for Uber had 8 terminal nodes.  We then pruned the tree to ensure there was no overfitting. We used 5 fold cross validation and found that the best size for the tree was still 8 terminal nodes.  The most important factor in predicting price per mile is distance.  If the distance is less than 0.08 miles, the price per mile of an Uber is always greater than if the distance is greater than 0.08 miles.  The service being Uber Economy also affects the price per mile for trips of all distances.  The training set for MSE for the Uber regression tree is 35.46 and the training set MSE for the Uber linear model is 198.26.  Based on this, we see that the regression tree does a better job predicting price per mile, since the MSE value is much lower.
+
+```{r}
+# uber
+# fit a tree
+tree_u <- tree(price_per_mile ~ distance + service +pickup + dropoff+ bad_weather + Isweekend + rush_hour , data = train_u)
+summary(tree_u)
+plot(tree_u)
+text(tree_u,pretty=0)
+## 5 fold cross validation 
+set.seed(567)
+(cv.u <- cv.tree(tree_u, FUN = prune.tree, K = 5))
+## best size equals to original size
+(bestsize <- cv.u$size[which.min(cv.u$dev)])
+
+# MSE from uber regression tree
+pred1 <- predict(tree_u,test_u)
+head(pred1)
+MSE1 <- mean((test_u$price_per_mile-pred1)^2)
+MSE1
+
+
+#MSE from uber linear regression
+(MSE_u <- mean((test_u$price_per_mile - exp(pred_u$fit))^2))
+```
+
+The original regression tree for Lyft had 6 terminal nodes. After we pruned the tree using 5 fold cross validation, we found that the best size for the tree was still 6 terminal nodes.  The most important factor in predicting price per mile is the service being Lyft Economy, while distance also plays a role in predicting price per mile.  If the service is Lyft Economy and the distance is less than 0.505 miles, the price per mile will be the largest. If the service is Lyft Economy and the distance is between 0.895 and 1.735 miles, the price per mile will be the lowest.  The training set MSE for the Lyft regression tree is 18.66, while the training set MSE for the Lyft linear model is 19.07.  Again, the regression tree for Lyft has a smaller MSE than that of the Lyft linear regression, so the regression tree does a better job of predicting price per mile.
+
+```{r}
+# lyft
+# fit a tree
+tree_l <- tree(price_per_mile ~ distance + service + dropoff + pickup + bad_weather + Isweekend + rush_hour , data = train_l)
+summary(tree_l)
+plot(tree_l)
+text(tree_l,pretty = 0)
+## 5 fold cross validation 
+set.seed(567)
+(cv.l <- cv.tree(tree_l, FUN = prune.tree, K = 5))
+## best size equals to original size
+(bestsize <- cv.l$size[which.min(cv.l$dev)])
+
+# MSE from lyft regression tree
+pred2 <- predict(tree_l,test_l)
+head(pred2)
+MSE2 <- mean((test_l$price_per_mile-pred2)^2)
+MSE2
+
+
+#MSE from lyft linear regression
+(MSE_l <- mean((test_l$price_per_mile - exp(pred_l$fit))^2))
+```
+
+## 3.Price difference: Uber VS Lyft 
+
+Next, we wanted to analyze whether there is a price difference between Uber and Lyft when given the same exact condtitions. 
+
+The two comparisons we did were:
+1. Uber Eco and Lyft Eco 
+2. Uber Premium and Lyft Premium
+
+We merged the Uber and Lyft data sets based on the same distance, if there is bad weather, if it's a weekend, if it's rush hour, and if it has the same pick up and drop off locations and then split the new merged data set in half, with one half being a training set and the other a test set.  Our first analysis was with UberEconomy vs LyftEconomy.
+
+### 3-1 Uber Economy VS Lyft Economy
+```{r}
+## Uber Economy VS Lyft Economy
+# merge dataset based on same situation:
+# distance/bad_weather/isweekend/rushhour/pickip/dropoff
+head(uber)
+samesub_e <- merge.data.frame(uber[uber$service == "Uber Economy",],lyft[lyft$service=="Lyft Economy",],by = intersect(c('distance','bad_weather','Isweekend','rush_hour','destination','source',"weekday","pickup","dropoff"),c('distance','bad_weather','Isweekend','rush_hour','destination','source',"weekday","pickup","dropoff")))
+# calculate uber,lyft price difference
+samesub_e$pricediff <- samesub_e$price.x - samesub_e$price.y
+```
+
+```{r}
+# split dataset
+set.seed(123)
+index <- sample(1:nrow(samesub_e),size= as.integer(nrow(samesub_e)*0.5))
+samesub_e.train <- samesub_e[index,]
+samesub_e.test <- samesub_e[-index,]
+```
+
+We fit a linear regression model to predict the price difference and used distance, drop off location, pick up location, if there's bad weather, if it's a weekend, if it's rush hour, and surge multiplier.  Distance, drop off, if there's bad weather and surge_multiplier all contribute to a price difference between Uber Economy and Lyft Economy, proven by their small p-values.  The residual plot, normality plot, and variance plot for this model all pass the model assumptions, so we can assume this model is a good fit to the data.
+
+First, let's take a look at our price diff distribution
+```{r}
+hist(samesub_e.train$pricediff,main = "Histogram of price difference between Uber Economy and Lyft Economy",xlab = "price difference")
+# Overall, Uber Economy's price tend to be higher than lyft
+ggplot(samesub_e.train,aes(x=distance,y=pricediff))+geom_point()
+
+ggplot(samesub_e.train,aes(x=as.factor(surge_multiplier.y),y=pricediff)) + geom_boxplot()
+```
+
+
+```{r}
+
+m.d <- lm(pricediff ~ distance + dropoff + pickup + bad_weather + Isweekend + rush_hour + as.factor(surge_multiplier.y), data = samesub_e.train)
+summary(m.d)
+
+# residual
+residualPlot(m.d)
+#normality
+qqPlot(m.d)
+#variance
+spreadLevelPlot(m6)
+
+# multicolinearity
+car::vif(m.d)
+# MSE
+mean((m.d$fitted.values - samesub_e.train$pricediff)^2)
+mean((predict(m.d,samesub_e.test)-samesub_e.test$pricediff)^2)
+```
+
+We fit a regression tree to the price difference model and found that the most important variable in predicting a price difference between UberEconomy and LyftEconomy is if there is a surge. This makes sense because Uber data does not include a surge so this would definitely be the number one cause in a difference in price between the two. 
+
+Moreover, we get some insights from the regression tree:
+1. If there is no surge which means surge multiplier equals to 1, taking ride with Uber will pay $1 dollar more than Lyft.
+2. If surge multiplier is lower than 2, taking ride with lyft will pay $4.9 more than uber.
+3. If surge multiplier is even higer, the difference will go up to $12.8 per ride.
+
+The MSE for the Economy linear model is 24.87 and the MSE for the Economy regression tree is 25.11.  So, again, we would use the regression tree as a more accurate predictor of price differences between Uber Economy and Lyft Economy.
+
+```{r}
+## tree
+tree.dif <- tree(pricediff ~ distance + dropoff + pickup + bad_weather + Isweekend + rush_hour + as.factor(surge_multiplier.y),data = samesub_e.train,split = "deviance")
+summary(tree.dif)
+plot(tree.dif)
+text(tree.dif,pretty = 0)
+# MSE-test
+pred.t <- predict(tree.dif,samesub_e.test)
+MSE2 <- mean((samesub_e.test$pricediff-pred.t)^2)
+MSE2
+```
+
+### 3-2 Uber Premium VS Lyft Premium
+
+We used the same predictors to find whether there is a price difference between Uber Premium and Lyft Premium.  Based on the summary, we see that distance, pick up, bad weather, if it's a weekend, if it's a rush hour and surge_multiplier all contribute to a price difference between Uber Premium and Lyft Premium, proven by their small p-values. Some calculations show that if pick up points at downtown, no bad weather, in weekdays and not in rush hours, we would ride with lyft with less expensive unless the ride miles more than 7.8 miles.((It is also interesting that different factors lead to price differences in different types of cars (eg. Uber Economy vs Uber Premium).  Further,  the model assumptions for this model hold, so we believe this model is a good fit for our data.)
+
+```{r}
+## Uber Premium VS Lyft Premium 
+# merge data
+samesub_p <- merge(uber[uber$service == "Uber Premium",],lyft[lyft$service=="Lyft Premium",],by=intersect(c('distance','bad_weather','Isweekend','rush_hour','destination','source',"weekday","pickup","dropoff"),c('distance','bad_weather','Isweekend','rush_hour','destination','source',"weekday","pickup","dropoff")))
+samesub_p$pricediff <- samesub_p$price.x - samesub_p$price.y
+
+# split data
+set.seed(123)
+index <- sample(1:nrow(samesub_p),as.integer(nrow(samesub_p)*0.5))
+samesub_p.train <- samesub_p[index,]
+samesub_p.test <- samesub_p[-index,]
+
+#First, let's take a look at our price diff distribution
+hist(samesub_p.train$pricediff,main = "Histogram of price difference between Uber Premium and Lyft Premium",xlab = "price difference")
+#The price difference tend to be normal distribution which means overall they tend to be identical.
+ggplot(samesub_p.train,aes(x=distance,y=pricediff))+geom_point()
+ggplot(samesub_p.train,aes(x=as.factor(surge_multiplier.y),y=pricediff)) + geom_boxplot()
+
+
+
+## linear model
+m.p <- lm(pricediff~ distance + dropoff + pickup + bad_weather + Isweekend + rush_hour + as.factor(surge_multiplier.y),data = samesub_p.train)
+summary(m.p)
+# residual
+residualPlots(m.p)
+qqPlot(m.p)
+# multicolinearity
+car::vif(m.p)
+# MSE
+mean((m.p$fitted.values - samesub_p.train$pricediff)^2)
+mean((predict(m.p,samesub_p.test)-samesub_p.test$pricediff)^2)
+```
+
+
+Similarly to the regression tree for the Economy style cars, the regression tree shows that the most important predictor in price difference is the surge, which again makes sense since Lyft has a surge and Uber does not. Compared to the regression tree for Economy, the cutoff point is different. As for no surge, uber will be $2.28 higher than lyft per ride. If surge multiplier is lower than 1.75, taking lyft will pay 5.3 dollars more than uber. If the surge multiplier is even higher, taking lyft will pay 16.53 dollars more than uber. The MSE for the Premium linear model is 67.91 and the MSE for the Premium regression tree is 68.49.  While the two errors are extremely close, the tree MSE is slightly smaller, so we would use this to predict whether there will be a difference in price between Uber and Lyft.
+
+```{r}
+## tree
+tree.dp <- tree(pricediff ~ distance + dropoff + pickup + bad_weather + Isweekend + rush_hour + as.factor(surge_multiplier.y),data = samesub_p.train,split = "deviance")
+summary(tree.dp)
+plot(tree.dp)
+text(tree.dp,pretty = 0)
+# MSE-test
+pred.t <- predict(tree.dp,samesub_p.test)
+MSE2 <- mean((samesub_p.test$pricediff-pred.t)^2)
+MSE2
+```
+
+## 4.Logistic Regression - Surge
+
+Next, we fit a logistic regression model to predict the odds that there will be a surge multiplier.  Since Uber does not have a surge multiplier attribute in the given data set, this will only be the log odds that there is a surge multiplier for a Lyft ride.
+
+First, we want to target useful predictors.
+```{r}
+g1 <- qplot(x=surge,                               
+      y=price_per_mile,
+      data=train_l,                    
+      geom="boxplot",       
+      xlab="Surge",
+      main = 'Price per mile',
+      ylim = c(0,50))
+
+g2 <- qplot(x=surge,                               
+      y=distance,
+      data=train_l,                     
+      geom="boxplot",       
+      xlab="Surge",
+      main = 'Distance',
+      ylim = c(0,8))
+
+
+g3 <- ggplot(train_l, aes(x= surge, group = pickup)) + 
+    geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") +
+    geom_text(aes( label = scales::percent(..prop..),
+                   y= ..prop.. ), stat= "count", vjust = -.5) +
+    labs(y = "Percent", fill="surge") +
+    facet_grid(~pickup) +
+    scale_y_continuous(labels = scales::percent) + ggtitle('Pick up')
+
+chisq.test(train_l$pickup, train_l$surge)
+
+g4 <- ggplot(train_l, aes(x= surge, group = dropoff)) + 
+    geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") +
+    geom_text(aes( label = scales::percent(..prop..),
+                   y= ..prop.. ), stat= "count", vjust = -.5) +
+    labs(y = "Percent", fill="surge") +
+    facet_grid(~dropoff) +
+    scale_y_continuous(labels = scales::percent) +ggtitle('Drop off')
+
+chisq.test(train_l$dropoff, train_l$surge)
+
+
+g5 <- ggplot(train_l, aes(x= surge, group = bad_weather)) + 
+    geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") +
+    geom_text(aes( label = scales::percent(..prop..),
+                   y= ..prop.. ), stat= "count", vjust = -.5) +
+    labs(y = "Percent", fill="surge") +
+    facet_grid(~bad_weather) +
+    scale_y_continuous(labels = scales::percent) +ggtitle('Bad weather')
+
+chisq.test(train_l$bad_weather, train_l$surge)
+
+
+
+g6 <- ggplot(train_l, aes(x= surge, group = Isweekend)) + 
+    geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") +
+    geom_text(aes( label = scales::percent(..prop..),
+                   y= ..prop.. ), stat= "count", vjust = -.5) +
+    labs(y = "Percent", fill="surge") +
+    facet_grid(~Isweekend) +
+    scale_y_continuous(labels = scales::percent) + ggtitle('Weekend')
+
+chisq.test(train_l$Isweekend, train_l$surge)
+
+
+
+g7 <- ggplot(train_l, aes(x= surge, group = rush_hour)) + 
+    geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") +
+    geom_text(aes( label = scales::percent(..prop..),
+                   y= ..prop.. ), stat= "count", vjust = -.5) +
+    labs(y = "Percent", fill="surge") +
+    facet_grid(~rush_hour) +
+    scale_y_continuous(labels = scales::percent) +ggtitle('Rush hour')
+
+chisq.test(train_l$rush_hour, train_l$surge)
+
+g8 <- ggplot(train_l, aes(x= surge, group = service)) + 
+    geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") +
+    geom_text(aes( label = scales::percent(..prop..),
+                   y= ..prop.. ), stat= "count", vjust = -.5) +
+    labs(y = "Percent", fill="surge") +
+    facet_grid(~service) +
+    scale_y_continuous(labels = scales::percent)+ggtitle('Service')
+
+chisq.test(train_l$service, train_l$surge)
+
+grid.arrange(g1,g2, ncol=2, nrow = 1)
+grid.arrange(g3,g4,g5,g6,g7,g8, ncol=3, nrow = 2)
+
+```
+
+
+From the plots and chi-square test, we think price per mile, distance, pickup ,and service would be good predictors.
+
+After building the logistic model, all variables we put are significant, meaning they are useful in predicting the log odds that there will a surge. We than use confusion matrix to compute the classification rate, which are up to 93%.   
+
+```{r}
+#surge data in training and testing data set
+sum(train_l$surge == 1)/ nrow(train_l)
+sum(test_l$surge == 1)/ nrow(test_l)
+
+#build surge glm
+ml1 <- glm(as.factor(surge) ~ price_per_mile + service + pickup + distance, family = 'binomial', data=train_l)
+summary(ml1)
+
+
+#no collinearity issue
+car::vif(ml1)
+
+# # confusion matrix
+glm.pred  <- rep(0,nrow(test_l))
+glm.probs <- predict.glm(ml1,newdata = test_l,type = "response")
+glm.pred[glm.probs>.5] <- 1
+table(glm.pred, test_l$surge)
+mean(glm.pred==test_l$surge)
+
+#precision rate
+(sum((glm.pred==test_l$surge)&(glm.pred==1))/sum(glm.pred==1))
+
+```
+
+
+We also wanted to explore at what unit price is surge pricing included in the price per mile cost.  From the plots, we see that our unit price cut off is around $16$.  We used a loop to find the most precise pice cut off value by measuring the misclassification, precision, and true positives rates. When increasing the threshold, the misclassication rate will go down, making the minimum equal to a random guess, so we will use the precision and true positive rates to find the cut off price.  We found that the best cut off price for a surge would be $15$ with a percision rate 0.14, so if the price per mile is above $15, there will likely be a surge.
+
+```{r}
+# from the plot, we can see that our unit price cut off should around 16.
+qplot(x=surge,                               
+      y=price_per_mile,
+      data=df1,                     
+      geom="boxplot",       
+      xlab="Surge",
+      ylim = c(0,50))
+```
+
+
+```{r}
+
+# we use a loop to find the perfect price by measuring misclassfication rate, precision:true positives/ all positives, true positive rate: ture positivies / predicted positives
+cutoff.p <- 25
+measures <- data.frame(misrate = rep(0,cutoff.p),precision = rep(0,cutoff.p),tpr = rep(0,cutoff.p),fpr = rep(0,cutoff.p))
+for (i in 1:cutoff.p) {
+  pred <- ifelse(test_l$price_per_mile > i,1,0)
+  measures$misrate[i] <- 1- mean(pred == test_l$surge)
+  measures$precision[i] <- sum((pred==test_l$surge)&(pred==1))/sum(pred==1)
+  measures$tpr[i] <- sum((pred==test_l$surge)&(pred==1))/sum(test_l$surge==1)
+  measures$fpr[i] <- sum((pred!=test_l$surge)&(pred==1))/sum(test_l$surge==0)
+}
+
+which.min(measures$misrate)
+# from the misclassfication plot, we can see that if we increase threshold, the rate will go down which means the minimum should equals to a random guess. This doesn't satisfy our goal.
+plot(measures$misrate)
+
+# we can see this precision and true positive rate plot, the best option should be both of the critera are high. 
+plot(measures$precision)
+
+
+(index <- which.max(measures$precision))
+measures[index,]
+```
+The precision rate of simple model is lower than logistic model. 
+
+## 5.Conclusion
+
+When predicting price per mile in Uber,  we would use the regression tree based on the lower MSE, making distance the best predictor for price per mile. Additionally, the particular service being Uber Ecomony is also helpful in predicting price per mile.  This makes sense because Uber sets different prices for different services, so these various set prices will lead to a difference in price per mile.  The regression tree is also superior to the linear model in this case because it more clearly shows and explains the extremely large or extremely small price per mile values, so it allows us to make better predictions for why these prices are the way they are. For example, we were able to see that most often high priced rides had low distances, and we could make the assumption that these were cancelled rides.
+
+Predicting price per mile in Lyft had a similar outcome to that of Uber.  The Lyft regression tree did a better job than the linear model based on the MSE value.  We were able to see that the Lyft service being Lyft Economy was the most important predictor for price per mile and that distance was also important in predicting this value.
+
+When predicting if there is a price difference between the same level service for Uber and Lyft, we found that the regression tree was the best tool to predict the difference.  The tree showed for both levels of service that a surge in price was the most important predictor to prove their is a difference in price between the two companies.  Uber does not have this surge value, so it is logical that it would be the most deciding factor of price between Uber and Lyft.
+
+From the surge logistic model, price per mile, distance, pickup ,and service are related to a surge or not. From the simple model, we found that when price per mile is over $15, there is likely a surge in unit price. However, the precision rate of simple model is lower than logistic model, which means price per mile is not the only factors driven a surge.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
